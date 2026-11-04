@@ -38,6 +38,13 @@ const SPEED_TEST_BYTES = TEST_BYTES;
 const DEFAULT_SPEED_TEST_COUNT = 50;
 const SPEED_TEST_BATCH_SIZE = 50;
 const SPEED_TEST_BATCH_DELAY_MS = 1000;
+const DEFAULT_SOURCE_FETCH_BATCH_SIZE = 3;
+const MIN_SOURCE_FETCH_BATCH_SIZE = 1;
+const MAX_SOURCE_FETCH_BATCH_SIZE = 50;
+const DEFAULT_SOURCE_FETCH_BATCH_INTERVAL_SECONDS = 0;
+const DEFAULT_SOURCE_FETCH_REQUEST_INTERVAL_SECONDS = 0;
+const MIN_SOURCE_FETCH_INTERVAL_SECONDS = 0;
+const MAX_SOURCE_FETCH_INTERVAL_SECONDS = 60;
 const DEFAULT_MANUAL_SPEED_TEST_BATCH_SIZE = SPEED_TEST_BATCH_SIZE;
 const MIN_MANUAL_SPEED_TEST_BATCH_SIZE = 1;
 const MAX_MANUAL_SPEED_TEST_BATCH_SIZE = SPEED_TEST_BATCH_SIZE;
@@ -1240,6 +1247,24 @@ async function getCollectorSettings(env) {
       ? DEFAULT_MIN_SPEED_TEST_BANDWIDTH
       : Number(minBandwidthValue);
   const speedTestMode = "scheduled";
+  const sourceBatchSize =
+    Number.isSafeInteger(settings.sourceBatchSize) &&
+    settings.sourceBatchSize >= MIN_SOURCE_FETCH_BATCH_SIZE &&
+    settings.sourceBatchSize <= MAX_SOURCE_FETCH_BATCH_SIZE
+      ? settings.sourceBatchSize
+      : DEFAULT_SOURCE_FETCH_BATCH_SIZE;
+  const sourceBatchIntervalSeconds =
+    Number.isSafeInteger(settings.sourceBatchIntervalSeconds) &&
+    settings.sourceBatchIntervalSeconds >= MIN_SOURCE_FETCH_INTERVAL_SECONDS &&
+    settings.sourceBatchIntervalSeconds <= MAX_SOURCE_FETCH_INTERVAL_SECONDS
+      ? settings.sourceBatchIntervalSeconds
+      : DEFAULT_SOURCE_FETCH_BATCH_INTERVAL_SECONDS;
+  const sourceRequestIntervalSeconds =
+    Number.isSafeInteger(settings.sourceRequestIntervalSeconds) &&
+    settings.sourceRequestIntervalSeconds >= MIN_SOURCE_FETCH_INTERVAL_SECONDS &&
+    settings.sourceRequestIntervalSeconds <= MAX_SOURCE_FETCH_INTERVAL_SECONDS
+      ? settings.sourceRequestIntervalSeconds
+      : DEFAULT_SOURCE_FETCH_REQUEST_INTERVAL_SECONDS;
   const manualBatchSize =
     Number.isSafeInteger(settings.manualBatchSize) &&
     settings.manualBatchSize >= MIN_MANUAL_SPEED_TEST_BATCH_SIZE &&
@@ -1425,6 +1450,9 @@ async function getCollectorSettings(env) {
     manualBatchSize,
     manualAddressIntervalSeconds,
     manualSpeedTestTimeoutSeconds,
+    sourceBatchSize,
+    sourceBatchIntervalSeconds,
+    sourceRequestIntervalSeconds,
     autoUpdateCount:
       Number.isSafeInteger(updateCount) && updateCount >= 0
         ? updateCount
@@ -1545,6 +1573,15 @@ async function saveCollectorSettings(env, updates) {
     }
   }
   if (
+    Object.prototype.hasOwnProperty.call(updates, "sourceBatchSize") ||
+    Object.prototype.hasOwnProperty.call(
+      updates,
+      "sourceBatchIntervalSeconds",
+    ) ||
+    Object.prototype.hasOwnProperty.call(
+      updates,
+      "sourceRequestIntervalSeconds",
+    ) ||
     Object.prototype.hasOwnProperty.call(updates, "manualBatchSize") ||
     Object.prototype.hasOwnProperty.call(updates, "manualBatchIntervalSeconds") ||
     Object.prototype.hasOwnProperty.call(
@@ -1808,28 +1845,29 @@ async function speedTestAndStore(
       }
     }
 
-    const timeoutAddresses = failedResults
+    const failedAddresses = failedResults
       .filter(
         (failure) =>
           batch.includes(failure.ip) &&
-          (failure.timedOut || isSpeedTestTimeoutFailure(failure.error)),
+          !isSubrequestLimitFailure(failure.error),
       )
       .map((failure) => failure.ip);
     const newlyBlacklistedAddresses = await addAddressesToBlacklist(
       env,
-      timeoutAddresses,
+      failedAddresses,
+      "测速失败",
     );
     autoBlacklistedAddresses.push(...newlyBlacklistedAddresses);
     if (newlyBlacklistedAddresses.length && options.logScheduledRequests) {
       emitScheduledLog(
         options.logEvent,
         "WARN",
-        "scheduled_speedtest_timeout_blacklisted",
+        "scheduled_speedtest_failed_blacklisted",
         {
           cron: options.cron || null,
           batchNumber: options.batchNumber || null,
           addresses: newlyBlacklistedAddresses,
-          reason: "speed-test request timeout",
+          reason: "speed-test request failed",
         },
       );
     }
@@ -2520,7 +2558,72 @@ export default {
           ) {
             return jsonResponse({ error: "sources 必须是字符串数组" }, 400);
           }
-          return await handleUpdate(env, null, body.sources);
+          let sourceSettingsOverride = null;
+          if (body.sourceSettings !== undefined) {
+            const settings = body.sourceSettings;
+            if (
+              !settings ||
+              typeof settings !== "object" ||
+              Array.isArray(settings)
+            ) {
+              return jsonResponse(
+                { error: "sourceSettings 必须是设置对象" },
+                400,
+              );
+            }
+            const currentSettings = await getCollectorSettings(env);
+            sourceSettingsOverride = {
+              batchSize:
+                settings?.batchSize === undefined
+                  ? currentSettings.sourceBatchSize
+                  : settings.batchSize,
+              batchIntervalSeconds:
+                settings?.batchIntervalSeconds === undefined
+                  ? currentSettings.sourceBatchIntervalSeconds
+                  : settings.batchIntervalSeconds,
+              requestIntervalSeconds:
+                settings?.requestIntervalSeconds === undefined
+                  ? currentSettings.sourceRequestIntervalSeconds
+                  : settings.requestIntervalSeconds,
+            };
+            if (
+              !Number.isSafeInteger(sourceSettingsOverride.batchSize) ||
+              sourceSettingsOverride.batchSize < MIN_SOURCE_FETCH_BATCH_SIZE ||
+              sourceSettingsOverride.batchSize > MAX_SOURCE_FETCH_BATCH_SIZE
+            ) {
+              return jsonResponse(
+                { error: "每批数据源链接数必须是 1-50 的整数" },
+                400,
+              );
+            }
+            if (
+              !Number.isSafeInteger(
+                sourceSettingsOverride.batchIntervalSeconds,
+              ) ||
+              sourceSettingsOverride.batchIntervalSeconds <
+                MIN_SOURCE_FETCH_INTERVAL_SECONDS ||
+              sourceSettingsOverride.batchIntervalSeconds >
+                MAX_SOURCE_FETCH_INTERVAL_SECONDS ||
+              !Number.isSafeInteger(
+                sourceSettingsOverride.requestIntervalSeconds,
+              ) ||
+              sourceSettingsOverride.requestIntervalSeconds <
+                MIN_SOURCE_FETCH_INTERVAL_SECONDS ||
+              sourceSettingsOverride.requestIntervalSeconds >
+                MAX_SOURCE_FETCH_INTERVAL_SECONDS
+            ) {
+              return jsonResponse(
+                { error: "数据源批次和请求间隔必须是 0-60 秒的整数" },
+                400,
+              );
+            }
+          }
+          return await handleUpdate(
+            env,
+            null,
+            body.sources,
+            sourceSettingsOverride,
+          );
         }
         case "/raw":
           return await handleRawIPs(
@@ -4158,7 +4261,12 @@ function isBlacklisted(address, blacklistPreprocessed) {
   return false;
 }
 /* ====================== 核心：更新 + 自动测速 ====================== */
-async function handleUpdate(env, cronSchedule = null, sourcesOverride = null) {
+async function handleUpdate(
+  env,
+  cronSchedule = null,
+  sourcesOverride = null,
+  sourceSettingsOverride = null,
+) {
   const startTime = Date.now();
   const MAX_EXECUTION_TIME = 28000; // 28秒限制，避免30秒超时
   // 资源监控配置
@@ -4189,7 +4297,7 @@ async function handleUpdate(env, cronSchedule = null, sourcesOverride = null) {
   }
   // 1) 初始数据获取并行化：更新地址与最近历史数据
   const [initial, historicalData] = await Promise.all([
-    updateAllAddresses(env, sourcesOverride),
+    updateAllAddresses(env, sourcesOverride, sourceSettingsOverride),
     getRecentHistoryData(env, 3),
   ]);
   const { uniqueAddresses, results, addressesWithLocation } = initial;
@@ -4666,20 +4774,56 @@ async function recordHistoryKey(env, key) {
   await saveHistoryKeys(env, keys);
 }
 /* ====================== 地址收集 —— 支持 IPv4、IPv6 和域名 ====================== */
-async function updateAllAddresses(env, sourcesOverride = null) {
+async function updateAllAddresses(
+  env,
+  sourcesOverride = null,
+  sourceSettingsOverride = null,
+) {
   const urls = Array.isArray(sourcesOverride)
     ? sourcesOverride
     : await getSources(env);
+  const savedSettings = await getCollectorSettings(env);
+  const sourceSettings = {
+    batchSize:
+      Number.isSafeInteger(sourceSettingsOverride?.batchSize) &&
+      sourceSettingsOverride.batchSize >= MIN_SOURCE_FETCH_BATCH_SIZE &&
+      sourceSettingsOverride.batchSize <= MAX_SOURCE_FETCH_BATCH_SIZE
+        ? sourceSettingsOverride.batchSize
+        : savedSettings.sourceBatchSize,
+    batchIntervalSeconds:
+      Number.isSafeInteger(sourceSettingsOverride?.batchIntervalSeconds) &&
+      sourceSettingsOverride.batchIntervalSeconds >=
+        MIN_SOURCE_FETCH_INTERVAL_SECONDS &&
+      sourceSettingsOverride.batchIntervalSeconds <=
+        MAX_SOURCE_FETCH_INTERVAL_SECONDS
+        ? sourceSettingsOverride.batchIntervalSeconds
+        : savedSettings.sourceBatchIntervalSeconds,
+    requestIntervalSeconds:
+      Number.isSafeInteger(sourceSettingsOverride?.requestIntervalSeconds) &&
+      sourceSettingsOverride.requestIntervalSeconds >=
+        MIN_SOURCE_FETCH_INTERVAL_SECONDS &&
+      sourceSettingsOverride.requestIntervalSeconds <=
+        MAX_SOURCE_FETCH_INTERVAL_SECONDS
+        ? sourceSettingsOverride.requestIntervalSeconds
+        : savedSettings.sourceRequestIntervalSeconds,
+  };
   const results = [];
   const blacklistRaw = await getBlacklist(env);
   const blacklistPreprocessed = preprocessBlacklist(blacklistRaw);
 
   // 优化：先收集所有地址到临时数组，最后统一去重（提高去重优先级）
   const tempAddresses = []; // 临时数组存储所有提取的地址
-  for (let i = 0; i < urls.length; i += 3) {
-    const batch = urls.slice(i, i + 3);
+  for (let i = 0; i < urls.length; i += sourceSettings.batchSize) {
+    const batch = urls.slice(i, i + sourceSettings.batchSize);
     const settled = await Promise.allSettled(
-      batch.map((u) => fetchURLWithTimeout(u)),
+      batch.map(async (url, index) => {
+        const requestDelayMs =
+          index * sourceSettings.requestIntervalSeconds * 1000;
+        if (requestDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, requestDelayMs));
+        }
+        return fetchURLWithTimeout(url);
+      }),
     );
     settled.forEach((res, idx) => {
       const url = batch[idx];
@@ -4722,10 +4866,14 @@ async function updateAllAddresses(env, sourcesOverride = null) {
         });
       }
     });
-    if (i + 3 < urls.length)
-      await new Promise((r) =>
-        setTimeout(r, Math.floor(Math.random() * 51) + 120),
-      ); // 动态延迟优化
+    if (
+      i + sourceSettings.batchSize < urls.length &&
+      sourceSettings.batchIntervalSeconds > 0
+    ) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, sourceSettings.batchIntervalSeconds * 1000),
+      );
+    }
   }
 
   // 在所有来源地址收集完毕后，第一时间进行去重（提高去重优先级）
@@ -5409,15 +5557,65 @@ async function getSources(env) {
   return (await getCollectorSettings(env)).sources;
 }
 async function handleSetSources(req, env) {
-  const { sources } = await req.json();
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return jsonResponse({ error: "请求内容必须是有效 JSON" }, 400);
+  }
+  const { sources } = body || {};
   if (!Array.isArray(sources) || sources.some((s) => typeof s !== "string")) {
     return jsonResponse(
       { error: "Invalid sources: must be an array of strings" },
       400,
     );
   }
-  await saveCollectorSettings(env, { sources });
-  return jsonResponse({ success: true });
+  const current = await getCollectorSettings(env);
+  const batchSize =
+    body.batchSize === undefined ? current.sourceBatchSize : body.batchSize;
+  const batchIntervalSeconds =
+    body.batchIntervalSeconds === undefined
+      ? current.sourceBatchIntervalSeconds
+      : body.batchIntervalSeconds;
+  const requestIntervalSeconds =
+    body.requestIntervalSeconds === undefined
+      ? current.sourceRequestIntervalSeconds
+      : body.requestIntervalSeconds;
+  if (
+    !Number.isSafeInteger(batchSize) ||
+    batchSize < MIN_SOURCE_FETCH_BATCH_SIZE ||
+    batchSize > MAX_SOURCE_FETCH_BATCH_SIZE
+  ) {
+    return jsonResponse(
+      { error: "每批数据源链接数必须是 1-50 的整数" },
+      400,
+    );
+  }
+  if (
+    !Number.isSafeInteger(batchIntervalSeconds) ||
+    batchIntervalSeconds < MIN_SOURCE_FETCH_INTERVAL_SECONDS ||
+    batchIntervalSeconds > MAX_SOURCE_FETCH_INTERVAL_SECONDS ||
+    !Number.isSafeInteger(requestIntervalSeconds) ||
+    requestIntervalSeconds < MIN_SOURCE_FETCH_INTERVAL_SECONDS ||
+    requestIntervalSeconds > MAX_SOURCE_FETCH_INTERVAL_SECONDS
+  ) {
+    return jsonResponse(
+      { error: "数据源批次和请求间隔必须是 0-60 秒的整数" },
+      400,
+    );
+  }
+  await saveCollectorSettings(env, {
+    sources,
+    sourceBatchSize: batchSize,
+    sourceBatchIntervalSeconds: batchIntervalSeconds,
+    sourceRequestIntervalSeconds: requestIntervalSeconds,
+  });
+  return jsonResponse({
+    success: true,
+    batchSize,
+    batchIntervalSeconds,
+    requestIntervalSeconds,
+  });
 }
 /* ====================== 黑名单管理 ====================== */
 async function getBlacklist(env) {
@@ -5430,7 +5628,7 @@ function isSpeedTestTimeoutFailure(error) {
 async function addAddressesToBlacklist(
   env,
   addresses,
-  reason = "测速请求超时",
+  reason = "测速失败",
 ) {
   const candidates = [
     ...new Set(
@@ -5453,9 +5651,9 @@ async function addAddressesToBlacklist(
     JSON.stringify([...blacklist, ...addedAddresses]),
   );
   console.warn(
-    "Speed-test timeout addresses added to blacklist:",
+    "Speed-test failed addresses added to blacklist:",
     JSON.stringify({
-      event: "speedtest_timeout_blacklisted",
+      event: "speedtest_failed_blacklisted",
       reason,
       addresses: addedAddresses,
     }),
@@ -5939,6 +6137,11 @@ async function serveHTML(env, request) {
     maxLatency,
     minBandwidth,
     speedTestMode,
+    sourceBatchSize: collectorSettings.sourceBatchSize,
+    sourceBatchIntervalSeconds:
+      collectorSettings.sourceBatchIntervalSeconds,
+    sourceRequestIntervalSeconds:
+      collectorSettings.sourceRequestIntervalSeconds,
     manualBatchSize: Number.isSafeInteger(collectorSettings.manualBatchSize)
       ? collectorSettings.manualBatchSize
       : DEFAULT_MANUAL_SPEED_TEST_BATCH_SIZE,
@@ -5959,6 +6162,11 @@ async function serveHTML(env, request) {
       ? collectorSettings.scheduledSpeedTestAddressIntervalSeconds
       : DEFAULT_SCHEDULED_SPEED_TEST_ADDRESS_INTERVAL_SECONDS,
     scheduledSpeedTestTimeoutSeconds: collectorSettings.scheduledSpeedTestTimeoutSeconds,
+    sourceBatchSize: collectorSettings.sourceBatchSize,
+    sourceBatchIntervalSeconds:
+      collectorSettings.sourceBatchIntervalSeconds,
+    sourceRequestIntervalSeconds:
+      collectorSettings.sourceRequestIntervalSeconds,
     scheduledSpeedTestEstimateAddressCount: (latest.ips || []).filter(
       (item) => typeof item?.address === "string" && item.address,
     ).length,
@@ -8449,7 +8657,7 @@ async function serveHTML(env, request) {
                         <button class="settings-option-btn" type="button" onclick="openSettingsModal('quality-countries-modal')"><strong>优选地区</strong><small>国家与数量</small></button>
                         <button class="settings-option-btn" type="button" onclick="openSettingsModal('display-limit-modal')"><strong>列表显示</strong><small>地址数量</small></button>
                         <button class="settings-option-btn" type="button" onclick="openPathModal()"><strong>访问路径</strong><small>自定义 URL</small></button>
-                        <button class="settings-option-btn" type="button" onclick="openSourcesModal()"><strong>数据来源</strong><small>采集地址</small></button>
+                        <button class="settings-option-btn" id="sources-settings-summary" type="button" onclick="openSourcesModal()"><strong>数据来源</strong><small>${data.sources_urls.length} 个来源 · 每批 ${data.sourceBatchSize} 个 · 批次 ${data.sourceBatchIntervalSeconds} 秒 · 请求 ${data.sourceRequestIntervalSeconds} 秒</small></button>
                         <button class="settings-option-btn" type="button" onclick="openBlacklistModal()"><strong>黑名单</strong><small>排除地址</small></button>
                         ${
                           showAdminButton
@@ -9013,8 +9221,23 @@ async function serveHTML(env, request) {
     <div class="modal" id="sources-modal">
         <div class="modal-content">
             <h3>数据来源</h3>
-            <p>每行填写一个来源 URL。清空后将停止采集。</p>
+            <p>每行填写一个来源 URL。清空后将停止采集。手动更新和定时采集均使用下方分批规则。</p>
             <textarea id="sources-textarea" rows="10" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border-input); background: var(--input-bg); color: var(--input-text);">${escapeHtml((data.sources_urls || []).join("\\n"))}</textarea>
+            <div class="rule-form-grid">
+                <div class="rule-field">
+                    <label for="source-batch-size">每批链接数（1-50）</label>
+                    <input type="number" id="source-batch-size" min="1" max="50" step="1" value="${data.sourceBatchSize}">
+                </div>
+                <div class="rule-field">
+                    <label for="source-batch-interval">批次间隔（秒）</label>
+                    <input type="number" id="source-batch-interval" min="0" max="60" step="1" value="${data.sourceBatchIntervalSeconds}">
+                </div>
+                <div class="rule-field">
+                    <label for="source-request-interval">请求间隔（秒）</label>
+                    <input type="number" id="source-request-interval" min="0" max="60" step="1" value="${data.sourceRequestIntervalSeconds}">
+                </div>
+            </div>
+            <small id="sources-status" role="status"></small>
             <div class="modal-buttons">
                 <button class="button button-secondary" onclick="closeSourcesModal()">取消</button>
                 <button class="button button-success" onclick="saveSources()">保存</button>
@@ -9286,6 +9509,10 @@ async function serveHTML(env, request) {
                 });
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.error || '恢复失败');
+                if (setting === 'sources') {
+                    ['sources', 'sourceBatchSize', 'sourceBatchIntervalSeconds', 'sourceRequestIntervalSeconds']
+                        .forEach(clearLocalSettingsFallback);
+                }
                 const status = statusId ? document.getElementById(statusId) : null;
                 if (status) status.textContent = '已恢复默认值，保存后立即生效。';
                 window.setTimeout(() => location.reload(), 450);
@@ -9871,6 +10098,9 @@ async function serveHTML(env, request) {
         let currentSourcesUrls = ${JSON.stringify(data.sources_urls || [])
           .replace(/</g, "\\u003c")
           .replace(/>/g, "\\u003e")};
+        let currentSourceBatchSize = ${data.sourceBatchSize};
+        let currentSourceBatchIntervalSeconds = ${data.sourceBatchIntervalSeconds};
+        let currentSourceRequestIntervalSeconds = ${data.sourceRequestIntervalSeconds};
         let currentBlacklist = ${JSON.stringify(data.blacklist || [])
           .replace(/</g, "\\u003c")
           .replace(/>/g, "\\u003e")};
@@ -10084,6 +10314,21 @@ async function serveHTML(env, request) {
         }
         function applyLocalSettingsFallback() {
             const settings = readLocalSettingsFallback();
+            if (Number.isSafeInteger(settings.sourceBatchSize)) {
+                currentSourceBatchSize = settings.sourceBatchSize;
+                const input = document.getElementById('source-batch-size');
+                if (input) input.value = String(settings.sourceBatchSize);
+            }
+            if (Number.isSafeInteger(settings.sourceBatchIntervalSeconds)) {
+                currentSourceBatchIntervalSeconds = settings.sourceBatchIntervalSeconds;
+                const input = document.getElementById('source-batch-interval');
+                if (input) input.value = String(settings.sourceBatchIntervalSeconds);
+            }
+            if (Number.isSafeInteger(settings.sourceRequestIntervalSeconds)) {
+                currentSourceRequestIntervalSeconds = settings.sourceRequestIntervalSeconds;
+                const input = document.getElementById('source-request-interval');
+                if (input) input.value = String(settings.sourceRequestIntervalSeconds);
+            }
             if (Number.isSafeInteger(settings.displayLimit) && settings.displayLimit >= 0) {
                 const input = document.getElementById('ip-limit-input');
                 if (input) input.value = settings.displayLimit === 0 ? '' : String(settings.displayLimit);
@@ -11830,9 +12075,22 @@ async function serveHTML(env, request) {
             try {
                 const localSettings = readLocalSettingsFallback();
                 const updateOptions = { method: 'POST' };
-                if (Array.isArray(localSettings.sources)) {
+                const hasLocalSourceSettings =
+                    Number.isSafeInteger(localSettings.sourceBatchSize) &&
+                    Number.isSafeInteger(localSettings.sourceBatchIntervalSeconds) &&
+                    Number.isSafeInteger(localSettings.sourceRequestIntervalSeconds);
+                if (Array.isArray(localSettings.sources) || hasLocalSourceSettings) {
                     updateOptions.headers = { 'Content-Type': 'application/json' };
-                    updateOptions.body = JSON.stringify({ sources: localSettings.sources });
+                    const body = {};
+                    if (Array.isArray(localSettings.sources)) body.sources = localSettings.sources;
+                    if (hasLocalSourceSettings) {
+                        body.sourceSettings = {
+                            batchSize: localSettings.sourceBatchSize,
+                            batchIntervalSeconds: localSettings.sourceBatchIntervalSeconds,
+                            requestIntervalSeconds: localSettings.sourceRequestIntervalSeconds
+                        };
+                    }
+                    updateOptions.body = JSON.stringify(body);
                 }
                 const response = await fetch('/update', updateOptions);
                 const data = await response.json();
@@ -11948,6 +12206,9 @@ async function serveHTML(env, request) {
             const textarea = document.getElementById('sources-textarea');
             if (!modal || !textarea) return;
             textarea.value = currentSourcesUrls.join('\\n');
+            document.getElementById('source-batch-size').value = String(currentSourceBatchSize);
+            document.getElementById('source-batch-interval').value = String(currentSourceBatchIntervalSeconds);
+            document.getElementById('source-request-interval').value = String(currentSourceRequestIntervalSeconds);
             modal.style.display = 'flex';
         }
         function closeSourcesModal() {
@@ -11958,16 +12219,38 @@ async function serveHTML(env, request) {
             const textarea = document.getElementById('sources-textarea');
             if (!textarea) return;
             const sources = textarea.value.split('\\n').map(s => s.trim()).filter(s => s);
+            const batchSize = Number(document.getElementById('source-batch-size').value);
+            const batchIntervalSeconds = Number(document.getElementById('source-batch-interval').value);
+            const requestIntervalSeconds = Number(document.getElementById('source-request-interval').value);
+            const status = document.getElementById('sources-status');
+            if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 50) {
+                if (status) status.textContent = '每批数据源链接数必须是 1-50 的整数';
+                showMessage('每批数据源链接数必须是 1-50 的整数', 'error');
+                return;
+            }
+            if (!Number.isSafeInteger(batchIntervalSeconds) || batchIntervalSeconds < 0 || batchIntervalSeconds > 60 ||
+                !Number.isSafeInteger(requestIntervalSeconds) || requestIntervalSeconds < 0 || requestIntervalSeconds > 60) {
+                if (status) status.textContent = '批次间隔和请求间隔必须是 0-60 秒的整数';
+                showMessage('批次间隔和请求间隔必须是 0-60 秒的整数', 'error');
+                return;
+            }
             try {
                 const response = await fetch('/set-sources', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sources })
+                    body: JSON.stringify({ sources, batchSize, batchIntervalSeconds, requestIntervalSeconds })
                 });
                 const data = await response.json();
                 if (response.ok && data.success) {
                     clearLocalSettingsFallback('sources');
+                    clearLocalSettingsFallback('sourceBatchSize');
+                    clearLocalSettingsFallback('sourceBatchIntervalSeconds');
+                    clearLocalSettingsFallback('sourceRequestIntervalSeconds');
                     currentSourcesUrls = sources;
+                    currentSourceBatchSize = data.batchSize;
+                    currentSourceBatchIntervalSeconds = data.batchIntervalSeconds;
+                    currentSourceRequestIntervalSeconds = data.requestIntervalSeconds;
+                    if (status) status.textContent = '已保存；手动更新和定时采集均使用该规则。';
                     showMessage('来源设置成功');
                     closeSourcesModal();
                     await refreshData();
@@ -11976,11 +12259,20 @@ async function serveHTML(env, request) {
                 }
             } catch (error) {
                 console.error('保存来源失败:', error);
-                const savedLocally = writeLocalSettingsFallback({ sources: sources });
+                const savedLocally = writeLocalSettingsFallback({
+                    sources: sources,
+                    sourceBatchSize: batchSize,
+                    sourceBatchIntervalSeconds: batchIntervalSeconds,
+                    sourceRequestIntervalSeconds: requestIntervalSeconds
+                });
                 if (savedLocally) {
                     currentSourcesUrls = sources;
-                    const status = document.getElementById('sources-settings-status');
-                    if (status) status.textContent = '本浏览器本地设置；手动更新使用此列表，Cron 使用服务端上次保存值';
+                    currentSourceBatchSize = batchSize;
+                    currentSourceBatchIntervalSeconds = batchIntervalSeconds;
+                    currentSourceRequestIntervalSeconds = requestIntervalSeconds;
+                    if (status) status.textContent = '已暂存到本浏览器；Cron 仍使用服务端上次保存的来源和分批规则。';
+                    const footerStatus = document.getElementById('sources-settings-status');
+                    if (footerStatus) footerStatus.textContent = '本浏览器本地设置；手动更新使用此规则，Cron 使用服务端上次保存值';
                     closeSourcesModal();
                     await refreshData();
                     showMessage('服务端保存失败，来源已保存到本浏览器；手动更新使用此列表，Cron 仍使用服务端上次保存值。错误：' + error.message, 'error');
@@ -12156,6 +12448,35 @@ async function serveHTML(env, request) {
                     if (batchSizeInput) batchSizeInput.value = String(data.manualBatchSize);
                     const batchSizeLabel = document.getElementById('manual-speedtest-batch-size');
                     if (batchSizeLabel) batchSizeLabel.textContent = String(data.manualBatchSize);
+                }
+                currentSourceBatchSize =
+                    Number.isSafeInteger(localSettings.sourceBatchSize)
+                        ? localSettings.sourceBatchSize
+                        : data.sourceBatchSize;
+                currentSourceBatchIntervalSeconds =
+                    Number.isSafeInteger(localSettings.sourceBatchIntervalSeconds)
+                        ? localSettings.sourceBatchIntervalSeconds
+                        : data.sourceBatchIntervalSeconds;
+                currentSourceRequestIntervalSeconds =
+                    Number.isSafeInteger(localSettings.sourceRequestIntervalSeconds)
+                        ? localSettings.sourceRequestIntervalSeconds
+                        : data.sourceRequestIntervalSeconds;
+                [
+                    ['source-batch-size', currentSourceBatchSize],
+                    ['source-batch-interval', currentSourceBatchIntervalSeconds],
+                    ['source-request-interval', currentSourceRequestIntervalSeconds]
+                ].forEach(function(setting) {
+                    const input = document.getElementById(setting[0]);
+                    if (input && Number.isSafeInteger(setting[1])) input.value = String(setting[1]);
+                });
+                const sourceSummary = document.querySelector('#sources-settings-summary small');
+                if (sourceSummary && Number.isSafeInteger(currentSourceBatchSize) &&
+                    Number.isSafeInteger(currentSourceRequestIntervalSeconds)) {
+                    sourceSummary.textContent =
+                        (Array.isArray(data.sources_urls) ? data.sources_urls.length : currentSourcesUrls.length) +
+                        ' 个来源 · 每批 ' + currentSourceBatchSize +
+                        ' 个 · 批次 ' + currentSourceBatchIntervalSeconds +
+                        ' 秒 · 请求 ' + currentSourceRequestIntervalSeconds + ' 秒';
                 }
                 if (Number.isSafeInteger(data.scheduledSpeedTestBatchSize)) {
                     const cronBatchSize = document.getElementById('cron-speedtest-batch-size');
@@ -12660,6 +12981,11 @@ async function handleRawIPs(env, limitParameter = undefined) {
       collectorSettings.scheduledSpeedTestAddressIntervalSeconds,
     scheduledSpeedTestTimeoutSeconds:
       collectorSettings.scheduledSpeedTestTimeoutSeconds,
+    sourceBatchSize: collectorSettings.sourceBatchSize,
+    sourceBatchIntervalSeconds:
+      collectorSettings.sourceBatchIntervalSeconds,
+    sourceRequestIntervalSeconds:
+      collectorSettings.sourceRequestIntervalSeconds,
     scheduledSpeedTestEstimateAddressCount: (latest.ips || []).filter(
       (item) => typeof item?.address === "string" && item.address,
     ).length,
@@ -14141,6 +14467,19 @@ async function handleResetSetting(req, env) {
     await env.IP_STORAGE.delete("custom_path");
   } else if (setting === "sources") {
     await env.IP_STORAGE.delete("sources_urls");
+    const raw = await env.IP_STORAGE.get(COLLECTOR_SETTINGS_KEY);
+    let collector = {};
+    try {
+      collector = raw ? JSON.parse(raw) || {} : {};
+    } catch (error) {
+      console.warn("Failed to parse collector settings while resetting sources:", error);
+    }
+    collector.sourceBatchSize = DEFAULT_SOURCE_FETCH_BATCH_SIZE;
+    collector.sourceBatchIntervalSeconds =
+      DEFAULT_SOURCE_FETCH_BATCH_INTERVAL_SECONDS;
+    collector.sourceRequestIntervalSeconds =
+      DEFAULT_SOURCE_FETCH_REQUEST_INTERVAL_SECONDS;
+    await env.IP_STORAGE.put(COLLECTOR_SETTINGS_KEY, JSON.stringify(collector));
   } else if (setting === "blacklist") {
     await env.IP_STORAGE.delete("blacklist_addresses");
   } else if (setting === "schedule") {
